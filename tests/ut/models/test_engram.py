@@ -13,12 +13,6 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-<<<<<<< HEAD
-from vllm_ascend.models.deepseek_v41.engram import embedding as embedding_mod
-from vllm_ascend.models.deepseek_v41.engram import npu
-from vllm_ascend.models.deepseek_v41.engram.common import engram_gate
-from vllm_ascend.patch.platform.patch_engram_config import AscendEngramConfig
-=======
 pytest.importorskip(
     "vllm.models.deepseek_v41",
     reason="DeepSeek V4.1 is unavailable on this vLLM release",
@@ -28,9 +22,9 @@ from vllm.config import EngramConfig, VllmConfig
 
 from vllm_ascend.models.deepseek_v41.engram import embedding as embedding_mod
 from vllm_ascend.models.deepseek_v41.engram import npu
+from vllm_ascend.models.deepseek_v41.engram.common import engram_gate
 from vllm_ascend.models.deepseek_v41.engram.parallel import resolve_dp_shared_memory
 from vllm_ascend.platform import _validate_engram_config
->>>>>>> 97cceb590 (fix(engram): reuse upstream node-local DP groups for multi-node serving)
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
