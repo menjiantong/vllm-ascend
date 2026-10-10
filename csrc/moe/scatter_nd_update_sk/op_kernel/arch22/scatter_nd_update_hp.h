@@ -220,9 +220,22 @@ public:
         uint64_t ubOffset = 0;
         uint64_t idx = batchBegin;
         for (uint64_t k = 0; k < batchRows; ++k) {
-            uint64_t linearIndex = static_cast<uint64_t>(indicesLocal_.GetValue(idx));
-            uint64_t gmOut = ResolveOutOffset<isViewStride0>(linearIndex, scatterLength_, firstDimStrideRows_,
-                                                             varStride0Elements_, 0);
+            const int64_t linearIndex = static_cast<int64_t>(indicesLocal_.GetValue(idx));
+            if (linearIndex < 0) {
+                // Skip marker: callers (DSA V4/V4.1 metadata builders) hand whole rows of
+                // [-1, -1] to mean "this token owns no cache slot, write nothing". The linear
+                // index is a signed sum of coordinates against positive masks, so a marker row
+                // is exactly a negative linear index; reinterpreting it as uint64_t instead of
+                // skipping it sends DataCopyPad ~8 KB (contiguous dim0) or ~248 KB (view dim0)
+                // below the output buffer -- an MTE invalid-GM-address fault, or silent
+                // corruption of whatever the allocator put there. The batch already sits in UB,
+                // so only the store is skipped.
+                ubOffset += slotElements_;
+                ++idx;
+                continue;
+            }
+            uint64_t gmOut = ResolveOutOffset<isViewStride0>(static_cast<uint64_t>(linearIndex), scatterLength_,
+                                                             firstDimStrideRows_, varStride0Elements_, 0);
             DataCopyPad(outputGm_[gmOut], buf[ubOffset], pout);
             ubOffset += slotElements_;
             ++idx;
@@ -235,6 +248,11 @@ public:
         uint64_t srcBase = process * indexTileLength_;
         for (uint64_t i = 0; i < rows; ++i) {
             int64_t linearIndex = static_cast<int64_t>(indicesLocal_.GetValue(i));
+            if (linearIndex < 0) {
+                // Skip marker, same contract as in DoBatch. Skipping before the tile loop also
+                // keeps the ping-pong MTE3_MTE2 flag pair balanced for this row.
+                continue;
+            }
             uint64_t srcRow = srcBase + i;
             DataCopyPadExtParams<T> pad{true, 0, 0, 0};
             for (uint64_t s = 0; s < scatterTileNum_; ++s) {

@@ -8,6 +8,9 @@ before running the compressor, indexer and sparse-attention operators without
 moving cache or scheduler knowledge back into the model.
 """
 
+import logging
+import os
+
 from dataclasses import dataclass
 from typing import Any
 
@@ -44,6 +47,8 @@ from vllm_ascend.worker.device_metadata import (
     DeviceMetadataTask,
     wait_for_device_metadata,
 )
+
+logger = logging.getLogger(__name__)
 
 V41_METADATA_BUFFER_SIZE = 1024
 
@@ -204,6 +209,14 @@ def _request_counts(common: Any, num_reqs: int):
     return num_decodes, num_decode_tokens, num_prefills, num_prefill_tokens
 
 
+# DSA_SCATTER_DROP_MARKERS=0 restores the pre-fix call (markers handed to the op as-is), so one
+# run can be compared against the next without editing this file twice. Diagnostic knob only.
+_DROP_MARKER_ROWS = os.environ.get("DSA_SCATTER_DROP_MARKERS", "1") != "0"
+logger.info("[dsa_v41] marker rows %s before the scatter op (DSA_SCATTER_DROP_MARKERS=%s)",
+            "dropped on host" if _DROP_MARKER_ROWS else "passed through to the op",
+            os.environ.get("DSA_SCATTER_DROP_MARKERS", "1"))
+
+
 def scatter_cache_sk(
     cache: torch.Tensor,
     slot_mapping: torch.Tensor,
@@ -213,13 +226,38 @@ def scatter_cache_sk(
 
     V4.1 cache planes can be views into a larger layer-outermost slot, so the
     physical page stride is not necessarily the contiguous stride implied by
-    the plane shape. ``npu_scatter_nd_update_sk`` preserves that stride and
-    treats the builder's ``[-1, -1]`` coordinates as skipped rows, matching V4.
+    the plane shape. ``npu_scatter_nd_update_sk`` preserves that stride.
+
+    It does **not** skip the builder's ``[-1, -1]`` marker rows, contrary to
+    what this docstring used to claim. Measured 10-08 on one card
+    (``scripts/test_scatter_nd_update_sk_skip.py --matrix``): the kernel sums
+    the signed coordinates (``ComputeLinearIndexFromIndices``,
+    ``csrc/.../arch22/scatter_nd_update_common.h:98``) and reinterprets the
+    result as ``uint64_t``, so a marker row writes 128 B at
+    ``plane_base - 254080`` when dim0 is a view stride (device fault: "MTE
+    accesses an invalid GM address" -- E9) and at ``plane_base - 8320`` when
+    dim0 is contiguous (no fault: it corrupts whatever the allocator placed
+    before the plane). Neither the aclnn wrapper, the tiling, nor any of the
+    kernels knows about the marker; ``device_op.py:46`` says outright that
+    "neither fast operator is assumed to skip them". So the marker rows are
+    dropped here, before the op ever sees them.
+
+    This is not the final form: ``keep.all()`` synchronizes the stream once
+    per call -- 3 calls per compressed layer, 18 compressed layers at
+    ``compress_ratio=2`` -- which is precisely what ``_request_counts`` above
+    avoids. The real fix is ``linearIndex < 0`` inside the kernel
+    (wiki/worklog_dsv41_top64_grpo.md §5.7.8, option C).
     """
     cache = cache.squeeze(-2)
     indices = slot_mapping[: values.shape[0]]
-    updates = values.to(cache.dtype).contiguous()
-    torch.ops._C_ascend.npu_scatter_nd_update_sk(cache, indices, updates)
+    updates = values.to(cache.dtype)
+    if _DROP_MARKER_ROWS and indices.numel():
+        keep = (indices >= 0).all(dim=-1) if indices.dim() == 2 else indices >= 0
+        if not bool(keep.all()):
+            indices, updates = indices[keep], updates[keep]
+    if indices.shape[0] == 0:
+        return
+    torch.ops._C_ascend.npu_scatter_nd_update_sk(cache, indices, updates.contiguous())
 
 
 def pad_sparse_indices(indices: torch.Tensor, topk: int) -> torch.Tensor:
