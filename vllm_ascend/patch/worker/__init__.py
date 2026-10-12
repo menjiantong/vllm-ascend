@@ -36,9 +36,22 @@ import vllm_ascend.patch.worker.patch_bind_kv_cache  # noqa
 import vllm_ascend.patch.worker.patch_step3p5  # noqa
 
 if get_current_hardware_profile().supports(HardwareCapability.STANDARD_WORKER_PATCHES):
-    import vllm_ascend.patch.worker.patch_qwen3_5  # noqa
-    import vllm_ascend.patch.worker.patch_qwen3_dflash  # noqa
-    import vllm_ascend.patch.worker.patch_qwen3vl  # noqa
+    # Local cluster note (2026-10-12): patch_qwen3_5 imports vllm_ascend.ops.gdn, which needs
+    # the `fla_npu` Ascend GDN-kernel package. fla_npu is not installed on this cluster (and is
+    # not on PyPI), so the plain import aborts every worker boot with ModuleNotFoundError.
+    # The Qwen3.5/GDN paths are inert for DeepSeek-V4.1 -- skip a patch whose dependency is
+    # missing instead of dying, while any *other* missing module still raises.
+    for _patch_name in ("patch_qwen3_5", "patch_qwen3_dflash", "patch_qwen3vl"):
+        try:
+            __import__(f"vllm_ascend.patch.worker.{_patch_name}")
+        except ModuleNotFoundError as _exc:
+            if _exc.name != "fla_npu":
+                raise
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "skipping %s: required package 'fla_npu' is not installed", _patch_name
+            )
 else:
     import vllm_ascend.patch.worker.patch_idex_310  # noqa
     import vllm_ascend.patch.worker.patch_v2.patch_spec_decode_310  # noqa
