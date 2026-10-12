@@ -944,9 +944,23 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
             }
         )
     else:
-        from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
+        # Local cluster note (2026-10-12): ops.gdn imports the `fla_npu` Ascend GDN-kernel
+        # package, which is not installed on this cluster (and is not on PyPI).
+        # GatedDeltaNetAttention is only used by Qwen3.5/Kimi-style GDN models; DeepSeek-V4.1
+        # never touches it. Register the op when the kernels exist, otherwise skip it (the
+        # upstream CustomOp fallback applies) instead of failing every worker boot.
+        try:
+            from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
 
-        REGISTERED_ASCEND_OPS["GatedDeltaNetAttention"] = AscendGatedDeltaNetAttention
+            REGISTERED_ASCEND_OPS["GatedDeltaNetAttention"] = AscendGatedDeltaNetAttention
+        except ModuleNotFoundError as exc:
+            if exc.name != "fla_npu":
+                raise
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "GatedDeltaNetAttention op not registered: package 'fla_npu' is not installed"
+            )
 
     for name, op_cls in REGISTERED_ASCEND_OPS.items():
         CustomOp.register_oot(_decorated_op_cls=op_cls, name=name)
