@@ -697,6 +697,12 @@ class AscendDSAV41Impl:
             source_cache = get_forward_context().no_compile_layers[self.long_kv_source_prefix].kv_cache[0]
         backend = getattr(attn, "packed_cache_ops", None)
         if backend is not None:
+            if os.environ.get("DSA41_ARG_DUMP") == "1":
+                print(
+                    f"[dsa41-args] layer={getattr(self, 'prefix', '?')} path=qsmla "
+                    f"q_len={q.shape[0]}",
+                    flush=True,
+                )
             compressed_lengths = None
             if self.role.has_long_context and attn.shared_state.topk_lengths is not None:
                 compressed_lengths = attn.shared_state.topk_lengths[: q.shape[0]]
@@ -735,6 +741,48 @@ class AscendDSAV41Impl:
             DeviceMetadataStage.ATTENTION,
             id(op_metadata),
         )
+        if os.environ.get("DSA41_ARG_DUMP") == "1":
+            # Local debug (2026-10-13): per-arg stats of the raw npu_sparse_flash_mla call,
+            # to pin which argument (or the kernel itself) goes bad at long contexts
+            # (NaN first appears in this method at len 700<L<1500, compressor layers).
+            def _argstats(tag, t):
+                try:
+                    if t is None:
+                        print(f"[dsa41-args] {tag}: None", flush=True)
+                        return
+                    if torch.is_tensor(t):
+                        is_int = not torch.is_floating_point(t)
+                        f = t.float()
+                        print(
+                            f"[dsa41-args] {tag}: shape={tuple(t.shape)} dtype={t.dtype} dtypei={is_int} "
+                            f"min={f.min().item():.6g} max={f.max().item():.6g} mean={f.mean().item():.6g} "
+                            f"nan={int(torch.isnan(f).sum())}",
+                            flush=True,
+                        )
+                    else:
+                        print(f"[dsa41-args] {tag}: {type(t).__name__}={t}", flush=True)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[dsa41-args] {tag}: <stats failed: {exc}>", flush=True)
+
+            print(
+                f"[dsa41-args] layer={getattr(self, 'prefix', '?')} path=raw_op "
+                f"has_compressed={has_compressed} ratio={ratio} q_len={q.shape[0]}",
+                flush=True,
+            )
+            _argstats("q", q)
+            _argstats("ori_sparse_indices", metadata.swa.ori_sparse_indices)
+            _argstats("ori_topk_length", metadata.swa.ori_topk_length)
+            _argstats("cmp_indices", cmp_indices)
+            _argstats("ori_block_table", ori_block_table)
+            _argstats("cmp_block_table", cmp_block_table)
+            _argstats("cu_seqlens_q", query_start_loc)
+            _argstats("seqused_ori_kv", seq_lens)
+            _argstats("seqused_cmp_kv", cmp_seq_lens)
+            _argstats("cmp_residual", cmp_residual)
+            _argstats("sinks", attn.attn_sink)
+            _argstats("ori_mask_mode", metadata.swa.ori_mask_mode)
+            _argstats("ori_win_left", metadata.swa.ori_win_left)
+            _argstats("ori_win_right", metadata.swa.ori_win_right)
         output, _ = torch.ops._C_ascend.npu_sparse_flash_mla(
             q,
             ori_kv=attn.dsa_attn.swa_cache_layer.kv_cache[0],
