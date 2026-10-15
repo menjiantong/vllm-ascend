@@ -1743,7 +1743,48 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                 batch_split_factor=1,
             )
             o_proj_input = o_proj_input.reshape(num_tokens, -1)
-            output[...] = self.wo_b(o_proj_input)
+            # [2026-10-13 tii consistency experiment] wo_b is a RowParallelLinear: its TP
+            # all-reduce sums the partials in bf16 (<0.4% error, measured; the trainer sums
+            # the same math in one fp32 GEMM). Opt-in fp32 all-reduce via env flag.
+            import os as _os
+
+            if (
+                _os.environ.get("VA_V41_OPROJ_FP32_AR", "0") == "1"
+                and getattr(self.wo_b, "reduce_results", False)
+                and getattr(self.wo_b, "tp_size", 1) > 1
+            ):
+                _saved = self.wo_b.reduce_results
+                self.wo_b.reduce_results = False
+                try:
+                    if _os.environ.get("VA_V41_OPROJ_FP32_PARTIAL", "0") == "1":
+                        # [2026-10-13 task1] The trainer computes one K=8192 GEMM with fp32
+                        # accumulation and casts ONCE; the engine's local GEMM rounds each
+                        # per-rank partial to bf16 before the (fp32) all-reduce -> 8 bf16
+                        # roundings vs 1 (~0.4%, the measured L0 o-proj floor 0.0047).
+                        # Run the local GEMM with fp32 inputs (a lossless cast of the bf16
+                        # activations/weights -- identical products, fp32 accumulate) and
+                        # leave the single cast at the very end.
+                        import torch.nn.functional as _F
+
+                        _w = self.wo_b.weight
+                        _b = getattr(self.wo_b, "bias", None)
+                        partial = _F.linear(
+                            o_proj_input.float(),
+                            _w.float(),
+                            None if _b is None else _b.float(),
+                        )
+                    else:
+                        partial = self.wo_b(o_proj_input)
+                finally:
+                    self.wo_b.reduce_results = _saved
+                import torch.distributed as _dist
+                from vllm.distributed import get_tp_group as _get_tp_group
+
+                partial = partial.float()
+                _dist.all_reduce(partial, group=_get_tp_group().device_group)
+                output[...] = partial.to(output.dtype)
+            else:
+                output[...] = self.wo_b(o_proj_input)
         return output
 
     def _prepare_caches_before_attention(

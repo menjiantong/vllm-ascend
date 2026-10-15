@@ -50,6 +50,43 @@ from vllm_ascend.worker.device_metadata import (
 
 logger = logging.getLogger(__name__)
 
+# [2026-10-13 tii consistency experiment] Env-gated torch-level replacement for the fused
+# partial-rope op, so the engine can run the "small-ops" path and be compared with the
+# trainer op-by-op (VA_V41_TORCH_ROPE=1; default off -> fused op untouched). The math
+# mirrors BOTH references exactly:
+#   * golden: tests/e2e/nightly/single_node/ops/singlecard_ops/test_inplace_partial_rotary_mul.py
+#     (fp32 element-wise pair rotation, even-position sin negated, single rounding on write-back)
+#   * trainer: FSDPTurbo fsdp_turbo/models/deepseek_v41/model.py::apply_rotary_emb
+#     (fp32 complex multiply over adjacent pairs, in-place copy back to activation dtype)
+# The op object is monkey-patched process-wide (unit tests use the same setattr pattern,
+# raising=False), which covers every call site (dsa_v41 prolog/output/latent/compressor).
+if os.environ.get("VA_V41_TORCH_ROPE", "0") == "1":
+
+    def _torch_inplace_partial_rotary_mul(
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        rotary_mode: str = "interleave",
+        partial_slice=None,
+        negate_sin: bool = False,
+    ) -> None:
+        assert partial_slice is not None, "partial_slice required for the torch rope path"
+        assert rotary_mode in ("interleave", "interleaved"), rotary_mode
+        start, end = partial_slice
+        x_sub = x[..., start:end]  # in-place target (a view)
+        x32 = x_sub.float()
+        c = cos.float()
+        s = (-sin if negate_sin else sin).float()
+        swap = torch.empty_like(x32)
+        swap[..., 0::2] = x32[..., 1::2]
+        swap[..., 1::2] = x32[..., 0::2]
+        sin_term = swap * s
+        sin_term[..., 0::2] = -sin_term[..., 0::2]
+        x_sub.copy_((x32 * c + sin_term).to(x_sub.dtype))
+
+    torch.ops._C_ascend.inplace_partial_rotary_mul = _torch_inplace_partial_rotary_mul
+    logger.warning("[VA_V41_TORCH_ROPE] fused partial-rope replaced by torch small-ops path")
+
 V41_METADATA_BUFFER_SIZE = 1024
 
 
@@ -267,6 +304,211 @@ def pad_sparse_indices(indices: torch.Tensor, topk: int) -> torch.Tensor:
     return indices.unsqueeze(1).contiguous().int()
 
 
+# [2026-10-13 train-vs-infer consistency, task 1] Small-ops replacement for the fused
+# `npu_sparse_flash_mla` kernel. The fused kernel is the last un-replaced "fused op" of the
+# attention stage (op-diff table rows 5/9); this path reproduces the TRAINER's eager math
+# (`FSDPTurbo/fsdp_turbo/ops/cpu/sparse_attention.py`, the op the trainer actually runs) on the
+# engine's own paged caches, so the two stacks stop disagreeing on this stage by construction:
+#   * per query token: causal window [s1-win_left, s1+win_right] of the SWA plane (dense, -1
+#     handled by mask) + the indexer-selected rows of the compressed plane (ids, -1 = pad);
+#   * one sink-augmented fp32 softmax over the concatenated rows (local first, then compressed
+#     -- the trainer's order);
+#   * the two bf16 rounding points of the trainer: scores round-trip bf16 BEFORE the scale,
+#     probabilities round bf16 before PV.
+# Enabled by VA_V41_ATTN_EAGER=1 (default off). Only the causal dense-window deployment path
+# (ori_mask_mode=4, no ori_sparse_indices) is implemented -- anything else raises.
+_EAGER_STASH_CALLS: dict[str, int] = {}
+
+
+def _eager_gather_rows(plane: torch.Tensor, blk: torch.Tensor, off: torch.Tensor, block_size: int) -> torch.Tensor:
+    """Gather rows ``[n, K, D]`` for (block, offset) pairs from a paged cache plane.
+
+    The engine's planes are 24-51 GiB non-contiguous views (layer-outermost page stride).
+    ANY torch fancy-index over them makes the NPU kernel materialize a copy of the WHOLE
+    plane -- reproduced standalone on 2026-10-13: a 2-element dim0 index on a 24 GiB
+    strided plane requested 24.00 GiB (also the cause of the two dump OOMs). So gather
+    block-by-block instead: ``plane[b]`` is a view, and a single-axis index on that small
+    view costs only the rows actually taken. Unique-block count is small in practice
+    (compressed cache: <= seq/ratio/block_size blocks per request; window: the window span).
+    """
+    if plane.dim() != 4:
+        flat = plane.squeeze(-2) if plane.dim() == 3 and plane.shape[-2] == 1 else plane
+        return flat[blk * block_size + off]
+    d = plane.shape[-1]
+    blk_f = blk.reshape(-1).clamp(0, plane.shape[0] - 1)
+    off_f = off.reshape(-1)
+    rows = torch.empty(blk_f.numel(), d, dtype=plane.dtype, device=plane.device)
+    for b in blk_f.unique().tolist():
+        m = blk_f == b
+        rows[m] = plane[b].squeeze(-2)[off_f[m]]
+    return rows.view(*blk.shape, d)
+
+
+def sparse_flash_mla_eager(
+    q: torch.Tensor,
+    ori_plane: torch.Tensor,
+    cmp_plane: torch.Tensor | None,
+    ori_block_table: torch.Tensor,
+    cmp_block_table: torch.Tensor | None,
+    query_start_loc: torch.Tensor,
+    positions: torch.Tensor,
+    cmp_ids: torch.Tensor | None,
+    sink: torch.Tensor,
+    softmax_scale: float,
+    ori_block_size: int,
+    cmp_block_size: int,
+    win_left: int,
+    win_right: int,
+    chunk: int = 256,
+    align_fp32: bool = False,
+    stash: str | None = None,
+    stash_tag: str = "layer",
+) -> torch.Tensor:
+    """Trainer-matching sparse MLA on paged caches (small ops).
+
+    Layout: q ``[T, H, D]`` (TND); cache planes ``[slots, 1, D]`` with flat addressing
+    ``slot = block_id * block_size + offset`` (``scatter_cache_sk``); block tables ``[R, maxB]``;
+    ``cmp_ids`` ``[T, K]`` int32 with -1 padding. Positions are logical sequence positions
+    (the kernel's own convention: ``block_num = pos // block_size``).
+    """
+    if q.shape[0] == 0:
+        return q.new_empty(q.shape)
+    device = q.device
+    T = q.shape[0]
+    num_reqs = int(query_start_loc.numel()) - 1
+    query_lens = (query_start_loc[1 : num_reqs + 1] - query_start_loc[:num_reqs]).to(torch.long)
+    req_of = torch.repeat_interleave(torch.arange(num_reqs, device=device), query_lens)[:T]
+    p = positions[:T].to(torch.long)
+
+    bt = ori_block_table[:num_reqs].to(torch.long)
+    row_bt = bt[req_of]
+    max_b = max(int(row_bt.shape[1]), 1)
+    W = int(win_left) + 1 + int(win_right)
+    # The trainer's window (get_window_topk_idxs): start clamped at 0, positions ascending,
+    # the invalid tail last; the causal check is s2 <= s1.
+    start = (p - int(win_left)).clamp(min=0)
+    s2 = start[:, None] + torch.arange(W, device=device)[None, :]
+    valid = s2 <= p[:, None]
+    blk_ori = row_bt.gather(1, (s2 // ori_block_size).clamp(max=max_b - 1))
+    off_ori = s2 % ori_block_size
+    cmp_idx = None
+    if cmp_ids is not None and cmp_plane is not None and cmp_block_table is not None:
+        ids = cmp_ids[:T].to(torch.long)
+        bt_c = cmp_block_table[:num_reqs].to(torch.long)
+        row_bt_c = bt_c[req_of]
+        safe = ids.clamp_min(0)
+        blk_cmp = row_bt_c.gather(1, (safe // cmp_block_size).clamp(max=max(int(row_bt_c.shape[1]), 1) - 1))
+        cmp_idx = (blk_cmp, safe % cmp_block_size)
+        valid = torch.cat((valid, ids >= 0), dim=1)
+
+    sink_f = sink.reshape(-1).float()
+    out = torch.empty_like(q)
+    stash_first = None
+    debug = os.environ.get("VA_V41_ATTN_EAGER_DEBUG", "0") == "1"
+    for s in range(0, T, int(chunk)):
+        e = min(s + int(chunk), T)
+        # Gather per token chunk: the engine's compressed plane is a huge view and any
+        # whole-token-range gather can blow device memory (see _eager_gather_rows).
+        kv_sel = _eager_gather_rows(ori_plane, blk_ori[s:e], off_ori[s:e], ori_block_size)
+        vc = valid[s:e]
+        if cmp_idx is not None:
+            kv_sel = torch.cat(
+                (kv_sel, _eager_gather_rows(cmp_plane, cmp_idx[0][s:e], cmp_idx[1][s:e], cmp_block_size)),
+                dim=1,
+            )
+        # [2026-10-14 NaN fix] Paged-cache slots that were never written (or were recycled
+        # from a previous request) hold arbitrary device memory, NaN included. The softmax
+        # mask excludes them, but the PV einsum still multiplies their value by a zero
+        # probability -- and 0 * NaN = NaN, poisoning the output with row-uniform NaN dims
+        # (observed: token-0 + all-NaN logprobs once any request had read such a slot).
+        # Zero the masked entries so garbage can never leak through the multiply.
+        if not bool(vc.all()):
+            kv_sel = kv_sel.masked_fill(~vc.unsqueeze(-1), 0)
+        qc = q[s:e]
+        # [2026-10-14 NaN hunt] One-shot diagnostics: when the gathered KV carries NaN,
+        # print which columns (window position vs cmp id) are poisoned for a few rows.
+        if os.environ.get("VA_V41_ATTN_EAGER_NANDBG", "0") == "1":
+            _dbg_left = globals().setdefault("_NANDBG_LEFT", [6])
+            kv_bad = torch.isnan(kv_sel).any(-1)
+            if kv_bad.any() and _dbg_left[0] > 0:
+                _dbg_left[0] -= 1
+                msg = []
+                for r in kv_bad.any(1).nonzero().flatten()[:4].tolist():
+                    gr = r + s  # global row index within this call
+                    cols = kv_bad[r].nonzero().flatten()
+                    det = []
+                    for c in cols[:6].tolist():
+                        if c < W:
+                            s0 = max(int(p[gr]) - int(win_left), 0)
+                            det.append(f"win(abs={s0 + c})")
+                        else:
+                            cc = c - W
+                            idv = None
+                            if cmp_ids is not None and cc < cmp_ids.shape[1]:
+                                idv = int(cmp_ids[gr, cc])
+                            det.append(f"cmp(id={idv})")
+                    msg.append(
+                        f"row{gr} p={int(p[gr])} ncols={cols.numel()} "
+                        f"valid={int(vc[r][cols].sum())} cols={cols[:5].tolist()} {det}"
+                    )
+                print(
+                    f"[attn-eager-NANDBG:{stash_tag}] kv_sel NaN T={kv_sel.shape[0]} K={kv_sel.shape[1]} "
+                    f"W={W} q_nan={int(torch.isnan(qc).sum())} "
+                    f"sink_nan={int(torch.isnan(sink).sum())} | " + " | ".join(msg),
+                    flush=True,
+                )
+        # Mirror the trainer's exact chain (FSDPTurbo ops/cpu/sparse_attention.py):
+        # default -- QK einsum rounds to bf16, scale/mask/softmax in fp32, probs round to
+        # bf16 before PV; with VERL_DSV41_ALIGN_ATTN=1 (the align2/align3 recipe) both
+        # roundings are skipped and QK/PV run in fp32 with a single final cast.
+        if align_fp32:
+            scores = torch.einsum("nhd,nkd->nhk", qc.float(), kv_sel.float()) * softmax_scale
+        else:
+            scores = torch.einsum("nhd,nkd->nhk", qc, kv_sel).float() * softmax_scale
+        scores = scores.masked_fill(~vc.unsqueeze(1), float("-inf"))
+        sink_scores = sink_f.view(1, -1, 1).expand(qc.shape[0], sink_f.numel(), 1)
+        probs = torch.softmax(torch.cat((scores, sink_scores), dim=-1), dim=-1)[..., :-1]
+        if align_fp32:
+            out[s:e] = torch.einsum("nhk,nkd->nhd", probs, kv_sel.float()).to(q.dtype)
+        else:
+            out[s:e] = torch.einsum("nhk,nkd->nhd", probs.to(kv_sel.dtype), kv_sel).to(q.dtype)
+        if stash_first is None:
+            stash_first = (kv_sel.detach().to("cpu"), vc.detach().to("cpu"))
+        if debug and s == 0:
+            print(
+                f"[attn-eager:{stash_tag}] T={T} W={W} H={q.shape[1]} D={q.shape[-1]} "
+                f"cmp={'yes' if cmp_idx is not None else 'no'} ori_plane={tuple(ori_plane.shape)} "
+                f"chunk={int(chunk)}",
+                flush=True,
+            )
+
+    if stash:
+        n = _EAGER_STASH_CALLS.get(stash_tag, 0)
+        if n < 2 and stash_first is not None:
+            _EAGER_STASH_CALLS[stash_tag] = n + 1
+            try:
+                import pathlib
+
+                pathlib.Path(stash).mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {
+                        "q": q.detach().to("cpu"),
+                        "kv_sel_chunk0": stash_first[0],
+                        "valid_chunk0": stash_first[1],
+                        "sink": sink.detach().to("cpu"),
+                        "scale": float(softmax_scale),
+                        "positions": p.detach().to("cpu"),
+                        "qsl": query_start_loc.detach().to("cpu"),
+                        "chunk": int(chunk),
+                        "out": out.detach().to("cpu"),
+                    },
+                    f"{stash}/{str(stash_tag).replace('/', '_')}_{n}.pt",
+                )
+            except Exception:  # noqa: BLE001 -- best-effort diagnostics
+                pass
+    return out
+
+
 class AscendDSAV41Impl:
     """V4.1 execution boundary backed by fused Ascend operators.
 
@@ -352,6 +594,65 @@ class AscendDSAV41Impl:
         qr for its indexer and has no post-Wq_b Q RMSNorm. Stage events serialize
         the Cube matmuls; the final join makes SWA writes visible to attention.
         """
+        if os.environ.get("VA_V41_EAGER_QKV", "0") == "1":
+            # [2026-10-13 tii consistency experiment] Small-ops variant of the Q/KV prolog:
+            # plain F.linear + the module norms + the (env-swappable) rope op, without the
+            # stream overlap and CV quant wrappers. Isolates whether the remaining q-path
+            # gap vs the trainer (0.0026 rel, worklog §6.2; rope already proven bit-equal
+            # by VA_V41_TORCH_ROPE) lives in the projection GEMMs.
+            impl = attn.dsa_attn.dsa_attn.impl
+            q_a = F.linear(hidden_states, impl.wq_a.weight, impl.wq_a.bias)
+            qr = attn.q_norm(q_a)
+            q_b = F.linear(qr, impl.wq_b.weight, impl.wq_b.bias)
+            _stash = os.environ.get("VA_V41_EAGER_STASH_DIR")
+            if _stash:
+                try:
+                    import pathlib
+
+                    pathlib.Path(_stash).mkdir(parents=True, exist_ok=True)
+                    _tag = str(attn.rotary_emb.layername).replace("/", "_")
+                    torch.save(
+                        {
+                            "q_a": q_a.detach().to("cpu"),
+                            "qr": qr.detach().to("cpu"),
+                            "q_b_pre_rope": q_b.detach().to("cpu"),
+                            # 200-row recompute: the engine batch is padded (208 rows), the
+                            # trainer runs exactly 200 -- M-dependent matmul tiling is a
+                            # candidate for the residual ULP gap (probe 2026-10-13).
+                            "q_a_200": F.linear(hidden_states[:200], impl.wq_a.weight, impl.wq_a.bias).detach().to("cpu"),
+                            "q_b_200": F.linear(
+                                attn.q_norm(F.linear(hidden_states[:200], impl.wq_a.weight, impl.wq_a.bias)),
+                                impl.wq_b.weight,
+                                impl.wq_b.bias,
+                            ).detach().to("cpu"),
+                        },
+                        f"{_stash}/{_tag}.pt",
+                    )
+                except Exception:  # noqa: BLE001 -- stash is best-effort diagnostics
+                    pass
+            q = q_b.unflatten(-1, (attn.n_local_heads, attn.head_dim))
+            kv = attn.kv_norm(F.linear(hidden_states, impl.wkv.weight, impl.wkv.bias)).view(-1, 1, attn.head_dim)
+            torch.ops._C_ascend.inplace_partial_rotary_mul(
+                kv.unsqueeze(1),
+                cos,
+                sin,
+                rotary_mode="interleave",
+                partial_slice=[attn.nope_head_dim, attn.head_dim],
+            )
+            scatter_cache_sk(
+                attn.dsa_attn.swa_cache_layer.kv_cache[0],
+                swa_metadata.slot_mapping,
+                kv.squeeze(1),
+            )
+            torch.ops._C_ascend.inplace_partial_rotary_mul(
+                q.unsqueeze(1),
+                cos,
+                sin,
+                rotary_mode="interleave",
+                partial_slice=[attn.nope_head_dim, attn.head_dim],
+            )
+            return q.to(hidden_states.dtype), qr
+
         main_stream = torch.npu.current_stream()
         aux_stream = dsv4_dsa_overlap_stream()
         v1_impl = attn.dsa_attn.dsa_attn.impl
@@ -511,6 +812,11 @@ class AscendDSAV41Impl:
         """Run SparseFlashMla with the same PA metadata for both operator stages."""
         if source_cache is None and self.role.has_long_context:
             source_cache = get_forward_context().no_compile_layers[self.long_kv_source_prefix].kv_cache[0]
+        if os.environ.get("VA_V41_ATTN_EAGER", "0") == "1":
+            # [2026-10-13 consistency task 1] Small-ops replacement of the fused kernel.
+            return self._forward_attention_eager(
+                attn, q, metadata, compressed_indices, source_cache=source_cache
+            )
         has_compressed = self.role.compress_ratio in (1, 2)
         ratio = self.role.compress_ratio if has_compressed else 0
         num_reqs = metadata.swa.num_reqs
@@ -562,6 +868,66 @@ class AscendDSAV41Impl:
             return_softmax_lse=False,
         )
         return output
+
+    def _forward_attention_eager(self, attn, q, metadata, compressed_indices, *, source_cache=None):
+        """[2026-10-13 consistency task 1] Small-ops attention with the trainer's math.
+
+        Same paged caches and metadata as the fused call, but computed by `sparse_flash_mla_eager`.
+        Only the causal deployment path (dense SWA window, mask_mode=4) is implemented; anything
+        else raises loudly instead of silently computing different math. Set
+        VA_V41_ATTN_STASH_DIR to dump the first two calls per layer (offline replay fodder).
+        """
+        swa = metadata.swa
+        if swa.ori_sparse_indices is not None or int(swa.ori_mask_mode) != 4:
+            raise RuntimeError(
+                "VA_V41_ATTN_EAGER supports only the causal dense-window path "
+                f"(got ori_mask_mode={swa.ori_mask_mode}, "
+                f"ori_sparse_indices={'set' if swa.ori_sparse_indices is not None else 'None'})"
+            )
+        num_reqs = int(swa.num_reqs)
+        has_compressed = self.role.compress_ratio in (1, 2)
+        # [2026-10-14 NaN fix] Mirror the fused path's device-metadata wait before any
+        # paged-cache read. The SparseFlashMla metadata pipeline overlaps the compressor/
+        # indexer stages across streams; without this wait the eager path reads the paged
+        # caches *before* their async writers land (symptom: decode logits NaN / token 0
+        # for prompts shorter than the 128-token window; masked whenever anything
+        # else forces a sync, e.g. the dump extension's .cpu() captures).
+        operator_metadata = metadata.attention if has_compressed else metadata.swa
+        wait_for_device_metadata(
+            DeviceMetadataStage.ATTENTION,
+            id(operator_metadata.smla_metadata),
+        )
+        cmp_ids = None
+        cmp_plane = None
+        cmp_bt = None
+        cmp_bs = int(swa.storage_block_size)
+        if has_compressed and compressed_indices is not None and source_cache is not None:
+            cmp_ids = pad_sparse_indices(compressed_indices, self.topology.index_topk)[: q.shape[0], 0]
+            cmp_plane = source_cache
+            cmp_bt = metadata.attention.block_table[:num_reqs]
+            cmp_bs = int(metadata.attention.storage_block_size)
+        return sparse_flash_mla_eager(
+            q,
+            attn.dsa_attn.swa_cache_layer.kv_cache[0],
+            cmp_plane,
+            swa.block_table[:num_reqs],
+            cmp_bt,
+            swa.query_start_loc[: num_reqs + 1],
+            metadata.positions[: q.shape[0]],
+            cmp_ids,
+            attn.attn_sink,
+            attn.softmax_scale,
+            int(swa.storage_block_size),
+            cmp_bs,
+            int(swa.ori_win_left),
+            int(swa.ori_win_right),
+            chunk=int(os.environ.get("VA_V41_ATTN_EAGER_CHUNK", "256")),
+            # Mirror the trainer-side A/B switch: the align2/align3 trainer runs with
+            # VERL_DSV41_ALIGN_ATTN=1, so the eager must skip the two bf16 roundings too.
+            align_fp32=os.environ.get("VERL_DSV41_ALIGN_ATTN", "0") == "1",
+            stash=os.environ.get("VA_V41_ATTN_STASH_DIR"),
+            stash_tag=self.layer_name,
+        )
 
     @staticmethod
     def update_graph_params(*args, **kwargs):
