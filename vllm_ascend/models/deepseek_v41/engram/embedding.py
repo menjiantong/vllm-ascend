@@ -16,6 +16,7 @@ import json
 from pathlib import Path
 from typing import cast
 
+import os
 import torch
 import torch.distributed as dist
 from safetensors import safe_open
@@ -319,6 +320,35 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
             out = out[:num_tokens]
         if self.tp_size > 1:
             out = tensor_model_parallel_all_gather(out, dim=1)
+        # [dsv41 2026-10-17 E53/3.2] 引擎真实路径（model.py 直接调 embed_gathered）的 dump
+        _dump_dir = os.environ.get("VERL_DSV41_ENGRAM_DUMP_DIR", "")
+        if _dump_dir and not getattr(self, "_dsv41_dumped", False):
+            try:
+                _ids = gathered.reshape(gathered.shape[0] // max(num_tokens, 1), -1) if gathered.shape[0] != num_tokens else gathered
+                _valid_ratio = float((gathered >= 0).float().mean()) if gathered.numel() else 0.0
+                if _valid_ratio > 0.5:
+                    os.makedirs(_dump_dir, exist_ok=True)
+                    n = min(512, gathered.shape[0])
+                    torch.save(
+                        {
+                            "slot": getattr(self, "slot", None),
+                            "ids": gathered[:n].detach().cpu(),
+                            "rows": out[:n].detach().float().cpu(),
+                            "vocab_start": int(getattr(self, "vocab_start_idx", -1)),
+                            "vocab_end": int(getattr(self, "vocab_end_idx", -1)),
+                            "head_start": int(getattr(self, "head_start", -1)),
+                            "n_hash_cols": int(self.n_hash_cols),
+                            "valid_ratio": _valid_ratio,
+                            "num_tokens": int(num_tokens),
+                        },
+                        os.path.join(_dump_dir, f"engine_pid{os.getpid()}_slot{getattr(self, 'slot', -1)}.pt"),
+                    )
+                    self._dsv41_dumped = True
+                    print(f"[engram-dump] saved engine_pid{os.getpid()} slot={getattr(self,'slot',-1)} valid={_valid_ratio:.3f}", flush=True)
+                else:
+                    print(f"[engram-dump] skip low valid={_valid_ratio:.3f} num_tokens={num_tokens}", flush=True)
+            except Exception as _e:
+                print(f"[engram-dump] FAILED: {_e!r}", flush=True)
         return out[:, : self.n_hash_cols]
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
@@ -330,7 +360,32 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
         """
         num_tokens = indices.shape[0]
         gathered = gather_engram_hashes(indices, dp_shared_memory=self._shared_group is not None)
-        return self.embed_gathered(gathered, num_tokens)
+        out = self.embed_gathered(gathered, num_tokens)
+        # [dsv41 2026-10-17 E53/3.2] 一次性 dump（ids + 取到的行 + 本 rank 的行范围），用于离线对照
+        # checkpoint 原始表行，判定"取数映射"是否正确。VERL_DSV41_ENGRAM_DUMP_DIR 为空则关闭。
+        _dump_dir = os.environ.get("VERL_DSV41_ENGRAM_DUMP_DIR", "")
+        _valid_ratio = float((indices >= 0).float().mean()) if indices.numel() else 0.0
+        if _dump_dir and _valid_ratio > 0.5 and not getattr(self, "_dsv41_dumped", False):
+            try:
+                import torch as _torch
+                os.makedirs(_dump_dir, exist_ok=True)
+                n = min(512, num_tokens)
+                _torch.save(
+                    {
+                        "slot": getattr(self, "slot", None),
+                        "ids": indices[:n].detach().cpu(),
+                        "rows": out[:n].detach().float().cpu(),
+                        "vocab_start": int(getattr(self, "vocab_start_idx", -1)),
+                        "vocab_end": int(getattr(self, "vocab_end_idx", -1)),
+                        "head_start": int(getattr(self, "head_start", -1)),
+                        "n_hash_cols": int(self.n_hash_cols),
+                    },
+                    os.path.join(_dump_dir, f"engine_pid{os.getpid()}.pt"),
+                )
+                self._dsv41_dumped = True
+            except Exception:
+                pass
+        return out
 
     def lookup(self, indices: torch.Tensor, out: torch.Tensor, background: bool = False) -> None:
         """Look up this shard's heads into ``[tokens, padded_heads, dim]`` bf16.

@@ -1130,6 +1130,27 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             assert hashes is not None
             # One DP gather feeds every layer sharing the split table.
             gathered = gather_engram_hashes(hashes, dp_shared_memory=self.engram_dp_shared_memory)
+            # [dsv41 E53/3.2] 对齐 dump：input_ids+positions+hashes（第 60 次调用≈decode）
+            import os as _os_ex
+            _dump_ex = _os_ex.environ.get("VERL_DSV41_ENGRAM_DUMP_DIR_EX", "")
+            if _dump_ex:
+                _cnt = getattr(self, "_dsv41_call_cnt", 0) + 1
+                self._dsv41_call_cnt = _cnt
+                if _cnt >= 60 and not getattr(self, "_dsv41_dumped_ex", False):
+                    try:
+                        import torch as _t
+                        _os_ex.makedirs(_dump_ex, exist_ok=True)
+                        n = min(8192, input_ids.shape[0])
+                        _t.save({
+                            "input_ids": input_ids[:n].detach().cpu(),
+                            "positions": positions[:n].detach().cpu(),
+                            "hashes": hashes[:n].detach().cpu(),
+                            "call": _cnt,
+                        }, _os_ex.path.join(_dump_ex, f"engine_align_pid{_os_ex.getpid()}.pt"))
+                        self._dsv41_dumped_ex = True
+                        print(f"[engram-dump-ex] saved engine align call={_cnt}", flush=True)
+                    except Exception as _e:
+                        print(f"[engram-dump-ex] FAILED {_e!r}", flush=True)
             for slot, (layer_id, table) in enumerate(zip(config.engram_layer_ids, tables)):
                 lookups[layer_id] = table.embed_gathered(gathered[:, slot], hashes.shape[0]).flatten(1)
         else:

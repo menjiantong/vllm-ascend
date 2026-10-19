@@ -213,10 +213,36 @@ class CaMemAllocator:
             handle = data.handle
             if data.tag in offload_tags:
                 size_in_bytes = handle[1]
-                cpu_backup_tensor = torch.empty(size_in_bytes, dtype=torch.uint8, device="cpu", pin_memory=True)
+                # [dsv41 2026-10-16] M24: on these shared multi-NUMA nodes the pinned
+                # attempt fails (M15 fallback below) and the driver's failure slowpath
+                # spent SECONDS per allocation; the weights pool holds hundreds of
+                # segments (291 observed), so the first engine sleep crawled for ~35 min
+                # (E27, task41/42). VERL_DSV41_CAMEM_BACKUP_PIN=0 makes the backup
+                # pageable up front, skipping the doomed-and-slow pinned attempts.
+                _pin = os.environ.get("VERL_DSV41_CAMEM_BACKUP_PIN", "1") == "1"
+                try:
+                    cpu_backup_tensor = torch.empty(
+                        size_in_bytes, dtype=torch.uint8, device="cpu", pin_memory=_pin
+                    )
+                except (torch.OutOfMemoryError, RuntimeError):
+                    # [dsv41 2026-10-15] The NPU driver pinned-host allocator
+                    # (aclrtMallocHostWithCfg) can fail on these shared multi-NUMA nodes
+                    # even with >1.5 TB RAM free (task 3.1b..3.1g, see
+                    # worklog_dsv41_119_bringup.md E10/E11). A pageable backup keeps the
+                    # colocated sleep working; the copy is slower, not different.
+                    cpu_backup_tensor = torch.empty(
+                        size_in_bytes, dtype=torch.uint8, device="cpu", pin_memory=False
+                    )
                 cpu_ptr = cpu_backup_tensor.data_ptr()
                 ACL_MEMCPY_DEVICE_TO_HOST = 2
                 dest_max = cpu_ptr + size_in_bytes * 2
+                # [dsv41 2026-10-16] M26: touch the destination pages before the DMA.
+                # A fresh torch.empty() only reserves VA; the first device->host copy
+                # into untouched pageable pages faults them in one at a time, and a
+                # single such copy stalled >40 min on one shared node (E32/task48,
+                # frozen on one 18MB segment while other replicas slept in 11s).
+                # Sequential zero-fill faults (and NUMA-places) them up front.
+                cpu_backup_tensor.zero_()
                 memcpy(cpu_ptr, dest_max, ptr, size_in_bytes, ACL_MEMCPY_DEVICE_TO_HOST)
                 data.cpu_backup_tensor = cpu_backup_tensor
             unmap_and_release(handle)
