@@ -5199,7 +5199,18 @@ class NPUModelRunner(GPUModelRunner):
                 page_size_bytes // dtype_size
             )
 
-            stride = torch.empty(shape).stride()
+            # [2026-10-19 countbenchqa E02] Compute the contiguous strides
+            # arithmetically.  ``torch.empty(shape).stride()`` materializes a
+            # tensor as large as one layer's KV cache purely to read its
+            # strides; on the 16-chip V4.1 run the resulting alloc/free churn
+            # kept every worker spinning for 18+ minutes at engine startup.
+            # A contiguous tensor's strides are just the suffix products.
+            stride = []
+            _acc = 1
+            for _dim in reversed(tuple(shape)):
+                stride.append(_acc)
+                _acc *= int(_dim)
+            stride = tuple(reversed(stride))
             target_stride = (num_element_per_page, *stride[1:])
             assert storage_offset_bytes % dtype_size == 0
             tensor = torch.as_strided(
