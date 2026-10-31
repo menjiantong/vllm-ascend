@@ -808,8 +808,13 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
             isinstance(kv_cache_spec, AscendMLAAttentionSpec)
             and getattr(kv_cache_spec, "model_version", None) == "deepseek_v41"
         ):
-            logical_block_size = vllm_config.cache_config.block_size
-            if kv_cache_spec.block_size != logical_block_size:
+            logical_block_size = int(vllm_config.cache_config.block_size)
+            # [1030 fix] 只允许把物理块“放大”到调度块，不允许被更小的 cache_config 覆盖：
+            # 新版 main 的 kv_cache_spec.block_size 已是调度块尺寸（这里 128），而 worker 的
+            # cache_config.block_size 可能被后端偏好改写为更小值（32）。若无条件覆盖，
+            # block_table 粒度（128 token/项）与 storage_block_size（128//2=64 行，被改成 16）
+            # 不一致，压缩序列越过半个块后按错误 block 索引读到未初始化 cache，表现为 decode NaN。
+            if kv_cache_spec.block_size < logical_block_size:
                 updates = {"block_size": logical_block_size}
                 if "storage_block_size" in kv_cache_spec.__dataclass_fields__:
                     updates["storage_block_size"] = logical_block_size // get_kv_cache_compression_ratio(kv_cache_spec)

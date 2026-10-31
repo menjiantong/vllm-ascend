@@ -15,6 +15,8 @@
 # limitations under the License.
 #
 
+import logging
+
 from vllm.triton_utils import HAS_TRITON
 
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
@@ -37,7 +39,17 @@ import vllm_ascend.patch.worker.patch_bind_kv_cache  # noqa
 import vllm_ascend.patch.worker.patch_step3p5  # noqa
 
 if get_current_hardware_profile().supports(HardwareCapability.STANDARD_WORKER_PATCHES):
-    import vllm_ascend.patch.worker.patch_qwen3_5  # noqa
+    # [1030 rebase] patch_qwen3_5 -> vllm_ascend.ops.gdn -> fla_npu；fla_npu 是 Qwen3.5
+    # GDN 的可选 NPU 算子包，本镜像未安装。该 patch 只服务 Qwen3.5，DeepSeek-V4.1
+    # 不经过 gdn.py；缺包时跳过，避免整个 vLLM worker 启动失败。
+    try:
+        import vllm_ascend.patch.worker.patch_qwen3_5  # noqa
+    except ModuleNotFoundError as exc:
+        if exc.name != "fla_npu":
+            raise
+        logging.getLogger(__name__).warning(
+            "skip vllm_ascend.patch.worker.patch_qwen3_5: fla_npu is not installed"
+        )
     import vllm_ascend.patch.worker.patch_qwen3_dflash  # noqa
     import vllm_ascend.patch.worker.patch_qwen3vl  # noqa
 else:

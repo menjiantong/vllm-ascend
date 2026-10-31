@@ -141,6 +141,15 @@ def resolve_bounded_replay(vllm_config: VllmConfig, cache_config: CacheConfig | 
         # nothing to warn about. Probed rather than read, so the lane does not
         # have to be named here.
         return False
+    if not vllm_config.use_v2_model_runner:
+        # [1030 rebase] 与 vllm 上游 attention.py 的 V1 分支保持一致：V1 不跳过
+        # replayed token 的 paged-KV 写入，开启 bounded replay 会让层 21-39 的
+        # KV 与 hidden state 错位，rollout 输出乱码/NaN。上游只在
+        # DeepseekV4Attention 内局部关闭，Ascend 缓存类不经过该路径，需在此补上。
+        logger.warning_once(
+            "SWA bounded replay needs model runner V2 on Ascend; disabled under V1."
+        )
+        return False
     if (
         vllm_config.parallel_config.prefill_context_parallel_size > 1
         and vllm_config.parallel_config.data_parallel_size > 1

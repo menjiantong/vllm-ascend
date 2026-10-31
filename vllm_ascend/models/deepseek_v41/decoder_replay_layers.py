@@ -89,6 +89,11 @@ class AscendDecoderReplayLayers:
 
 
 def make_decoder_replay(model: "DeepseekV41Model", config: VllmConfig) -> AscendDecoderReplayLayers | None:
+    # [1030 rebase] V1 不跳过 replayed token 的 paged-KV 写入（vllm 上游
+    # attention.py 在 V1 下会关闭该开关），Ascend 这里也必须关闭，否则层 21-39
+    # 的 KV/hidden state 与调度器错位，rollout 输出乱码/NaN。
+    if not config.use_v2_model_runner:
+        return None
     if not getattr(config.cache_config, "swa_bounded_replay", False):
         return None
     parallel = config.parallel_config

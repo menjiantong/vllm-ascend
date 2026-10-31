@@ -943,9 +943,22 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
             }
         )
     else:
-        from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
-
-        REGISTERED_ASCEND_OPS["GatedDeltaNetAttention"] = AscendGatedDeltaNetAttention
+        # [1030 rebase] GatedDeltaNetAttention 依赖可选包 fla_npu（Qwen3.5 GDN 的 NPU
+        # 算子），本镜像未安装。DeepSeek-V4.1 没有 GDN 层，缺包时跳过该 custom op 注册，
+        # 避免整个 vLLM worker 启动失败；使用 Qwen3.5 时仍需安装 fla_npu。
+        try:
+            from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
+        except ModuleNotFoundError as exc:
+            if exc.name != "fla_npu":
+                raise
+            import warnings
+            warnings.warn(
+                "GatedDeltaNetAttention not registered: fla_npu is not installed",
+                stacklevel=1,
+            )
+            AscendGatedDeltaNetAttention = None
+        if AscendGatedDeltaNetAttention is not None:
+            REGISTERED_ASCEND_OPS["GatedDeltaNetAttention"] = AscendGatedDeltaNetAttention
 
     for name, op_cls in REGISTERED_ASCEND_OPS.items():
         CustomOp.register_oot(_decorated_op_cls=op_cls, name=name)
