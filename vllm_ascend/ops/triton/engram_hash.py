@@ -113,6 +113,14 @@ def _hash_ids_kernel(
             other=-1,
         )
         known = in_window & (window_token >= 0)
+        # [1103 Engram 修复] window_token 未命中时为 -1（lookback 未覆盖该位置）。
+        # mask=known 为假，但 Ascend 后端仍会用该值参与地址计算；当 token_map
+        # 恰好位于映射段起始页（线上 data_ptr=0x12c551200000，页对齐）时，
+        # token_map + (-1) 落入未映射页，触发 vector core exception
+        # (The scalar instruction accesses an invalid GM address)。
+        # 把未命中的地址钳到 0：known 为真的 lane 取值不变，未命中 lane 仍被
+        # mask 掉（other=0），因此 hash 结果与修复前逐位一致。
+        window_token = tl.where(known, window_token, 0)
         window_source = tl.load(token_map + window_token, known, other=0)
         window_dead = tl.load(
             lookback_dead_mask + req * lookback_mask_row_stride + col * lookback_mask_col_stride,
