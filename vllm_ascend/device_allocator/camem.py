@@ -218,7 +218,12 @@ class CaMemAllocator(CuMemAllocator):
             handle = data.handle
             if data.tag in offload_tags:
                 size_in_bytes = handle[1]
-                cpu_backup_tensor = torch.empty(size_in_bytes, dtype=torch.uint8, device="cpu", pin_memory=True)
+                # [1103 主机内存] 121 等节点 sleep 备份 weights 时 rtMallocHost 失败
+                # (aclrtMallocHostWithCfg 207001: driver error out of memory)。
+                # MY_ENV_VLLM_SLEEP_PIN_MEMORY=0 退化为 pageable 主机内存，绕过
+                # 驱动 pinned 分配器；默认 1 保持原行为（125/254 验证过的路径）。
+                _pin = os.environ.get("MY_ENV_VLLM_SLEEP_PIN_MEMORY", "1") != "0"
+                cpu_backup_tensor = torch.empty(size_in_bytes, dtype=torch.uint8, device="cpu", pin_memory=_pin)
                 cpu_ptr = cpu_backup_tensor.data_ptr()
                 ACL_MEMCPY_DEVICE_TO_HOST = 2
                 dest_max = cpu_ptr + size_in_bytes * 2
