@@ -24,6 +24,8 @@ matching the LLM full-graph pattern in :mod:`vllm_ascend.attention.attention_v1`
 
 from __future__ import annotations
 
+import os
+
 import einops
 import torch
 import torch.nn.functional as F
@@ -225,6 +227,54 @@ class AscendMMEncoderAttention(MMEncoderAttention):
             is_reshaped=is_reshaped,
         )
 
+    def _forward_eager_fa(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor | None = None,
+        is_reshaped: bool,
+        bsz: int,
+        q_len: int,
+    ) -> torch.Tensor:
+        """与训练侧 fused_vision_flash_attention 使用同一个 FlashAttentionScore。
+
+        TND/BSND 在该算子上逐 bit 相同（1031 vision op A/B 已验证），TND 保留
+        变长 cu_seqlens 语义；不做 head_dim padding，以与训练侧完全一致。
+        """
+        actual_seq_lengths_q, actual_seq_lengths_kv = maybe_compute_actual_seq_lengths(
+            self._maybe_compute_cu_seqlens(bsz, q_len, cu_seqlens),
+            query.shape[0],
+            key.shape[0],
+            cudagraph_mm_encoder=False,
+        )
+        context_layer = torch_npu.npu_fusion_attention(
+            query.contiguous(),
+            key.contiguous(),
+            value.contiguous(),
+            self.num_heads,
+            input_layout="TND",
+            pse=None,
+            padding_mask=None,
+            atten_mask=None,
+            scale=self.scale,
+            keep_prob=1.0,
+            pre_tockens=SWA_INT_MAX,
+            next_tockens=SWA_INT_MAX,
+            inner_precise=0,
+            prefix=None,
+            actual_seq_qlen=actual_seq_lengths_q,
+            actual_seq_kvlen=actual_seq_lengths_kv,
+            sparse_mode=0,
+        )[0]
+        return self._restore_batch_layout(
+            context_layer,
+            bsz=bsz,
+            q_len=q_len,
+            is_reshaped=is_reshaped,
+        )
+
     def _forward_capture_fia(
         self,
         query: torch.Tensor,
@@ -342,7 +392,28 @@ class AscendMMEncoderAttention(MMEncoderAttention):
         q, k, v = self._reshape_qkv_to_3d(query, key, value, bsz, q_len, kv_len)
 
         if get_encoder_forward_context().capturing:
+            # MY_ENV_VLLM_VIT_ATTN_OP=fa 需要 eager 模式，见下方注释。
+            if os.environ.get("MY_ENV_VLLM_VIT_ATTN_OP", "fia") == "fa":
+                raise RuntimeError(
+                    "MY_ENV_VLLM_VIT_ATTN_OP=fa requires cudagraph_mm_encoder=False "
+                    "and enforce_eager=True"
+                )
             return self._forward_capture_fia(
+                q,
+                k,
+                v,
+                cu_seqlens=cu_seqlens,
+                is_reshaped=is_reshaped,
+                bsz=bsz,
+                q_len=q_len,
+            )
+
+        # 训推一致性开关：训练侧视觉注意力使用 npu_fusion_attention
+        # (FlashAttentionScore)，推理侧默认使用 npu_fused_infer_attention_score
+        # (FIA)。两者在 TND 下单算子相对误差约 5e-5，经 32 层 ViT 放大后视觉
+        # 特征相对误差约 0.8%；设为 fa 时改用训练同一算子，视觉塔输出逐 bit 一致。
+        if os.environ.get("MY_ENV_VLLM_VIT_ATTN_OP", "fia") == "fa":
+            return self._forward_eager_fa(
                 q,
                 k,
                 v,
