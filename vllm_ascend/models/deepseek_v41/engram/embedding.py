@@ -32,6 +32,8 @@ from vllm.model_executor.utils import set_weight_attrs
 # Upstream #56741 normalized the V4.1 model package name.
 from vllm.models.deepseek_v41.common.engram import ParallelEngramEmbedding
 
+from vllm_ascend.host_numa import host_alloc_spread_ctx
+
 from .npu import (
     HostUvaBuffer,
     SharedUvaBuffer,
@@ -138,6 +140,11 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
         return self.tp_size * self.dp_size, engram_head_shard_rank()
 
     def _allocate_weights(self) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # [1110] 大表“分配 + 首次填充”按 rank 摊到 NUMA 节点（默认 no-op）。
+        with host_alloc_spread_ctx():
+            return self._allocate_weights_impl()
+
+    def _allocate_weights_impl(self) -> tuple[torch.Tensor, torch.Tensor | None]:
         codes_shape = (self.part_num_embeddings, self.dim)
         scales_shape = (self.part_num_embeddings, self.dim // self.block_size)
         device = torch.device("npu", torch.npu.current_device())
@@ -264,6 +271,11 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
         )
 
     def _load_into_storage(self, model_path, key, chunk_rows) -> None:
+        # [1110] checkpoint 写入是共享表页的首次触达，整段按 rank 钉节点摊开（默认 no-op）。
+        with host_alloc_spread_ctx():
+            return self._load_into_storage_impl(model_path, key, chunk_rows)
+
+    def _load_into_storage_impl(self, model_path, key, chunk_rows) -> None:
         root = Path(model_path)
         scale_key = key.removesuffix(".weight") + ".scale"
         index = self._checkpoint_index(root, key)

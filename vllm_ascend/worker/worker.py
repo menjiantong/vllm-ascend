@@ -154,6 +154,10 @@ class NPUWorker(WorkerBase):
         **kwargs,
     ):
         """Initialize the worker for Ascend."""
+        # [1110] 主机 NUMA/THP 开关必须在任何大块 pinned/shm 分配之前生效（默认 no-op）。
+        from vllm_ascend.host_numa import disable_thp_if_requested
+
+        disable_thp_if_requested()
         if not envs_ascend.COMPILE_CUSTOM_KERNELS:
             logger.warning(
                 "COMPILE_CUSTOM_KERNELS is set to False. "
@@ -561,6 +565,13 @@ class NPUWorker(WorkerBase):
         # in ray scenario. see https://github.com/vllm-project/vllm/pull/26845
         # for more details
         self.device = self._init_device()
+        # 进程级 first-touch：WorkerBase.__init__ 不调用 init_device，必须在这里设置。
+        # 用 self.device.index 作为摊开索引：它是 _init_device 里经
+        # logical_device_id_to_visible_device_id 得到的真实物理卡号（本机 0..15），
+        # 而 self.local_rank 在两个 DP 引擎里都是 0..7（npu-smi 实测引擎 A→8..15）。
+        from vllm_ascend.host_numa import apply_process_pinning
+
+        apply_process_pinning(self.device.index if self.device.index is not None else self.local_rank)
         # FLA import-time capability queries must run on the selected worker
         # device, and registration must finish before any model is constructed.
         # TODO: Drop this separate call when supported vLLM FLA or Triton Ascend
