@@ -114,6 +114,28 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
         weight, scales = self._allocate_weights()
         self.weight = nn.Parameter(weight, requires_grad=False)
         self.weight_scale_inv = nn.Parameter(scales, requires_grad=False) if scales is not None else None
+
+        # The host-UVA shard-address tables are built while the sleep-mode
+        # weights mem-pool is active and are read by every Engram gather, so
+        # they have to survive a level-2 sleep.  Keep them as non-persistent
+        # buffers of this module so the worker's buffer backup path
+        # (``model.named_buffers()``) restores them; a plain attribute keeps
+        # its Python reference across sleep while its device storage is
+        # discarded and remapped empty, which makes the gather kernel
+        # dereference garbage host addresses (MTE invalid GM).  The registered
+        # buffer is the same tensor object as ``_codes_uva.ptrs`` / the scales
+        # table, and the host registration survives sleep (it is only released
+        # by ``close_host_offload``), so the restored values stay valid.
+        self.register_buffer(
+            "_codes_uva_ptrs",
+            self._codes_uva.ptrs if self._codes_uva is not None else None,
+            persistent=False,
+        )
+        self.register_buffer(
+            "_scales_uva_ptrs",
+            self._scales_uva.ptrs if self._scales_uva is not None else None,
+            persistent=False,
+        )
         for param in (self.weight, self.weight_scale_inv):
             if param is None:
                 continue
@@ -204,6 +226,10 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
                     requires_grad=False,
                 ),
             )
+        # Drop the address-table buffers with the host ranges: their entries
+        # point into memory that no longer exists.
+        self._codes_uva_ptrs = None
+        self._scales_uva_ptrs = None
 
     def bind_checkpoint(self, model_path, key: str) -> None:
         """Use parameter callbacks while retaining the indexed shard reader.

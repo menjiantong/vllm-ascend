@@ -391,3 +391,71 @@ def test_native_mxfp8_requires_e8m0_scales_before_allocation(tmp_path):
     )
     with pytest.raises(ValueError, match="requires E8M0 scales"):
         embedding_mod.preflight_engram_checkpoint(tmp_path, [1])
+
+
+def test_uva_pointer_tables_survive_level2_sleep_as_buffers(monkeypatch):
+    """The host-UVA shard-address tables must be restorable named buffers.
+
+    ``HostUvaBuffer.ptrs`` / ``SharedUvaBuffer.ptrs`` are allocated while the
+    sleep-mode weights mem-pool is active, so a level-2 sleep discards their
+    storage without a CPU backup.  Unless they are registered buffers, the
+    worker's ``named_buffers()`` restore path cannot bring the addresses back
+    and the first Engram gather after wake dereferences garbage (MTE invalid
+    GM address).
+    """
+    codes_ptrs = torch.arange(3, dtype=torch.int64)
+    scales_ptrs = torch.arange(2, dtype=torch.int64) + 10
+    closed: list[str] = []
+
+    monkeypatch.setattr(embedding_mod, "in_the_same_node_as", lambda group: [True])
+    monkeypatch.setattr(embedding_mod, "get_tp_group", lambda: SimpleNamespace(cpu_group=object()))
+    monkeypatch.setattr(embedding_mod, "get_engram_dp_group", lambda: None)
+    monkeypatch.setattr(embedding_mod, "get_engram_dp_size", lambda: 1)
+    monkeypatch.setattr(embedding_mod, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(embedding_mod, "get_tensor_model_parallel_rank", lambda: 0)
+
+    def build(codes_uva, scales_uva):
+        def allocate(table):
+            table._codes_uva = codes_uva
+            table._scales_uva = scales_uva
+            return (
+                torch.zeros(table.part_num_embeddings, 64),
+                torch.zeros(table.part_num_embeddings, 2),
+            )
+
+        monkeypatch.setattr(embedding_mod.AscendParallelEngramEmbedding, "_allocate_weights", allocate)
+        return embedding_mod.AscendParallelEngramEmbedding(8, 64, (1, 2, 3, 2), 0, cpu_offload=True)
+
+    table = build(
+        SimpleNamespace(ptrs=codes_ptrs, close=lambda: closed.append("codes")),
+        SimpleNamespace(ptrs=scales_ptrs, close=lambda: closed.append("scales")),
+    )
+    buffers = dict(table.named_buffers())
+    assert buffers["_codes_uva_ptrs"] is codes_ptrs
+    assert buffers["_scales_uva_ptrs"] is scales_ptrs
+    # Non-persistent: neither table may enter the checkpoint namespace.
+    assert "_codes_uva_ptrs" not in table.state_dict()
+    assert "_scales_uva_ptrs" not in table.state_dict()
+
+    # Reproduce the worker's level-2 contract: back every named buffer up,
+    # simulate the discarded pool (garbage contents), restore by name.
+    saved = {name: buffer.cpu().clone() for name, buffer in table.named_buffers()}
+    codes_ptrs.fill_(-1)
+    scales_ptrs.fill_(-1)
+    for name, buffer in table.named_buffers():
+        buffer.data.copy_(saved[name].data)
+    assert torch.equal(codes_ptrs, torch.arange(3, dtype=torch.int64))
+    assert torch.equal(scales_ptrs, torch.arange(2, dtype=torch.int64) + 10)
+
+    # Dropping the host ranges drops the address tables with them.
+    table.close_host_offload()
+    assert sorted(closed) == ["codes", "scales"]
+    assert table._codes_uva_ptrs is None
+    assert table._scales_uva_ptrs is None
+    assert table.weight.numel() == 0
+    assert table.weight_scale_inv.numel() == 0
+
+    # Device path (or a non-offloaded rank): no host tables, no buffers.
+    device_table = build(None, None)
+    assert "_codes_uva_ptrs" not in dict(device_table.named_buffers())
+    assert "_scales_uva_ptrs" not in dict(device_table.named_buffers())

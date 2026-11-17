@@ -27,7 +27,15 @@ TENSOR_LAYOUT_SAMPLE_LIMIT = 3
 # Runtime scratch tensors are local execution state, not checkpoint-derived
 # model state.  They must keep the capacity selected by the receiving instance
 # instead of being copied from a seed that may use different scheduler limits.
-_RUNTIME_ONLY_TENSOR_NAMES = frozenset({"topk_indices_buffer"})
+_RUNTIME_ONLY_TENSOR_NAMES = frozenset(
+    {
+        "topk_indices_buffer",
+        # Engram host-UVA address tables hold this process's
+        # aclrtHostGetDevicePointer values; a seed's entries are invalid here.
+        "_codes_uva_ptrs",
+        "_scales_uva_ptrs",
+    }
+)
 
 
 def _is_runtime_only_tensor(name: str) -> bool:

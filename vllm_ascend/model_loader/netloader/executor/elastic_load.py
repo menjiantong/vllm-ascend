@@ -30,6 +30,11 @@ from .netloader_pg import destroy_stateless_process_group, stateless_init_proces
 _NETLOADER_TRANSFER_ITEMS_ATTR = "_netloader_processed_layout_transfer_items"
 
 
+# Per-process device addresses: a seed's Engram host-UVA table entries are
+# meaningless in the receiver, so they must not ride the weight transfer.
+_RUNTIME_ONLY_TENSOR_NAMES = frozenset({"_codes_uva_ptrs", "_scales_uva_ptrs"})
+
+
 def _is_transferable_tensor(tensor: torch.Tensor) -> bool:
     return not tensor.is_meta and tensor.numel() > 0 and tensor.device.type == "npu"
 
@@ -79,6 +84,8 @@ def _try_collect_transferable_tensor(
     seen_data_ptrs: set[int],
     collected_tensors: list[tuple[str, torch.Tensor]],
 ) -> None:
+    if name.rsplit(".", 1)[-1] in _RUNTIME_ONLY_TENSOR_NAMES:
+        return
     if not _is_transferable_tensor(tensor):
         return
 
